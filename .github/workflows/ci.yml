@@ -1,0 +1,128 @@
+# Test, build the core once for every microcontroller, build real firmware for every board and
+# publish the packages as release v<VERSION>. A new release is only made when the version in
+# library.properties was raised (tags come from this workflow, not by hand). Pull requests get
+# the packages as a workflow artifact. Build and release in one job: same files, one runner.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', '!README.md', '!CHANGELOG.md', 'LICENSE', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', '!README.md', '!CHANGELOG.md', 'LICENSE', 'docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # PRs: cancel the old run; main: never cancel in the middle of a release
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Arduino cores the firmware is checked against (cache key below follows these)
+  CORE_AVR: arduino:avr@1.8.6
+  CORE_ESP8266: esp8266:esp8266@3.1.2
+  CORE_ESP32: esp32:esp32@3.3.13
+  CORE_RP2040: rp2040:rp2040@6.4.0
+  CORE_URLS: >-
+    https://arduino.esp8266.com/stable/package_esp8266com_index.json,https://espressif.github.io/arduino-esp32/package_esp32_index.json,https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write   # only for the release step
+    steps:
+      - uses: actions/checkout@v7   # Node 24
+
+      # ESP cross compilers (those of Arduino ESP8266 core 3.1.x / ESP32 core 2.0.17) from their
+      # upstream releases, SHA-256 pinned in tools/toolchains.sh
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ssd1306-oled/toolchains
+          key: toolchains-${{ hashFiles('tools/toolchains.sh') }}
+      - name: ESP toolchains
+        run: tools/toolchains.sh
+
+      # Cortex-M (RP2040): the official Arm GNU Toolchain, cached by the action (Node 24).
+      # Not from apt: Ubuntu wires newlib in via a postinst script a cache restore does not run.
+      - uses: carlosperate/arm-none-eabi-gcc-action@v1.14.1
+        with:
+          release: '13.2.Rel1'
+
+      # AVR from Ubuntu (gcc-avr 7.3 like Arduino AVR core 1.8.6) plus ccache, cached; no
+      # postinst needed. Bump "version" to force a fresh install.
+      - uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: gcc-avr avr-libc binutils-avr ccache
+          version: "1"
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+
+      # arduino-cli + the four Arduino cores for the real firmware (firmware-check)
+      - uses: arduino/setup-arduino-cli@v2.1.0   # Node 24
+        with:
+          version: 1.x
+          token: ${{ github.token }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.arduino15
+          key: arduino15-${{ env.CORE_AVR }}-${{ env.CORE_ESP8266 }}-${{ env.CORE_ESP32 }}-${{ env.CORE_RP2040 }}
+      - name: Arduino cores
+        run: |
+          have() { arduino-cli core list | awk '{print $1"@"$2}' | grep -qx "$1"; }
+          missing=""
+          for c in "$CORE_AVR" "$CORE_ESP8266" "$CORE_ESP32" "$CORE_RP2040"; do have "$c" || missing="$missing $c"; done
+          if [ -n "$missing" ]; then
+            arduino-cli core update-index --additional-urls "$CORE_URLS"
+            for c in $missing; do arduino-cli core install "$c" --additional-urls "$CORE_URLS"; done
+          fi
+          arduino-cli core list
+
+      - name: Toolchain versions
+        run: |
+          for c in gcc xtensa-lx106-elf-gcc xtensa-esp32-elf-gcc arm-none-eabi-gcc avr-gcc; do
+            echo '#include <string.h>' | $c -x c -fsyntax-only - || { echo "::error::$c: no libc headers"; exit 1; }
+            printf '%-22s %s\n' "$c" "$($c --version | head -1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+      # host tests (ASan/UBSan, fake controller) -> core for all targets -> packages ->
+      # firmware for Uno, Mega, D1 mini, ESP32, Pico W against the packaged zip
+      - name: Tests, all targets, packages, firmware
+        run: make -j"$(nproc)" firmware-check
+
+      - name: Sample screens
+        run: make screens
+
+      - name: Packages as artifact (pull requests)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ssd1306Oled-packages
+          path: |
+            build/pkg/
+            build/screens/
+          retention-days: 14
+
+      - name: Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(make -s print-version)
+          tag="v$v"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists - version not raised, nothing to do" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # the version's CHANGELOG section as release notes
+          awk -v v="## $v" '$0==v{f=1;next} /^## /{f=0} f' CHANGELOG.md > build/notes.md
+          gh release create "$tag" build/pkg/* --target "$GITHUB_SHA" --title "Ssd1306Oled $v" --notes-file build/notes.md
+          echo "Release $tag published" >> "$GITHUB_STEP_SUMMARY"
